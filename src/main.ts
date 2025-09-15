@@ -341,30 +341,28 @@ async function classifyEpubContent(
         wordCount: number;
         calibreChapterNumber?: number;
     } => {
-        // Extract calibre chapter information from h1.chap_n elements (do this first)
-        const calibreChapterMatch = content.match(/<h1[^>]*class="chap_n"[^>]*>.*?\[(\d+)\]/s);
-        const calibreChapterNumber = calibreChapterMatch ? parseInt(calibreChapterMatch[1]) : undefined;
-        
-        // Extract the full calibre chapter title by getting text content from h1.chap_n
-        let calibreFullTitle: string | undefined;
-        if (calibreChapterNumber !== undefined) {
-            const h1Match = content.match(/<h1[^>]*class="chap_n"[^>]*>(.*?)<\/h1>/s);
-            if (h1Match) {
-                // Remove HTML tags but keep the text content
-                const h1Content = h1Match[1].replace(/<[^>]*>/g, '').trim();
-                if (h1Content.includes(`[${calibreChapterNumber}]`)) {
-                    calibreFullTitle = h1Content;
-                }
-            }
+        // Extract calibre chapter information from h1.chapn elements (do this first)
+        const calibreChapterMatch = content.match(/<h1[^>]*class="chapn"[^>]*>(.*?)<\/h1>/s) ||
+                                   content.match(/<h1[^>]*class="chap_n"[^>]*>(.*?)<\/h1>/s);
+        let calibreChapterNumber: number | undefined;
+        if (calibreChapterMatch) {
+            // Extract just the number from the h1 content, ignoring HTML tags
+            const h1Text = calibreChapterMatch[1].replace(/<[^>]*>/g, '').trim();
+            // Handle both plain numbers (31) and bracketed numbers ([1])
+            const numberMatch = h1Text.match(/^(\d+)$/) || h1Text.match(/^\[(\d+)\]$/);
+            calibreChapterNumber = numberMatch ? parseInt(numberMatch[1]) : undefined;
         }
 
         // Extract title from various sources, but be smart about it
+        const h1Match = content.match(/<h1[^>]*>(.*?)<\/h1>/is);
+        const h1Text = h1Match ? h1Match[1].replace(/<[^>]*>/g, '').trim() : null;
+
         const titleMatches = [
             content.match(/<title[^>]*>([^<]+)<\/title>/i),
-            content.match(/<h1[^>]*>([^<]+)<\/h1>/i),
+            h1Text ? [null, h1Text] : null, // Convert to match format
             content.match(/<h2[^>]*>([^<]+)<\/h2>/i),
             content.match(/<h3[^>]*>([^<]+)<\/h3>/i)
-        ];
+        ].filter(Boolean); // Remove null entries
 
         // Analyze patterns first to determine content type
         const textContent = content
@@ -376,37 +374,33 @@ async function classifyEpubContent(
         const lowerText = textContent.toLowerCase();
 
         // Check for structural content types
-        const isEpilogue = lowerText.match(/^(epilogue|épilogue|conclusion|postface)/) || 
-                         (lowerContent.includes('<h1') && lowerContent.includes('épilogue'));
-        const isPrologue = lowerText.match(/^(prologue|préface|avant-propos|introduction)/) || 
-                         (lowerContent.includes('<h1') && lowerContent.includes('prologue'));
+        const isEpilogue = lowerText.match(/^(epilogue|épilogue|conclusion|postface)/) ||
+            (lowerContent.includes('<h1') && lowerContent.includes('épilogue'));
+        const isPrologue = lowerText.match(/^(prologue|préface|avant-propos|introduction)/) ||
+            (lowerContent.includes('<h1') && lowerContent.includes('prologue'));
 
         let title: string | undefined;
-        
-        // Priority 1: If we have a full calibre title (like "[116]"), use that
-        if (calibreFullTitle) {
-            title = calibreFullTitle;
+
+        // Priority 1: If we have a calibre chapter number, use it directly as the title
+        if (calibreChapterNumber !== undefined) {
+            title = calibreChapterNumber.toString();
         }
-        // Priority 2: If we have calibre chapter numbers but no full title, use generic chapter format
-        else if (calibreChapterNumber !== undefined) {
-            title = `Chapter ${calibreChapterNumber}`;
-        }
-        // Priority 3: For structural content (epilogue/prologue), use generic titles
+        // Priority 2: For structural content (epilogue/prologue), use generic titles
         else if (isEpilogue) {
             title = 'Epilogue';
         } else if (isPrologue) {
             title = 'Prologue';
-        } 
-        // Priority 4: Extract title from content, but be smart about what we accept
+        }
+        // Priority 3: Extract title from content only as last resort
         else {
             for (const match of titleMatches) {
                 if (match?.[1]) {
                     const candidateTitle = match[1].trim().replace(/&[^;]+;/g, ''); // Basic HTML entity cleanup
-                    
+
                     // Skip titles that look like dates or preliminary content for main chapters
                     const isDateLike = /^\w+\s+\d{1,2}\s+\w+\s+\d{4}$/.test(candidateTitle); // "Friday 22 November 2013"
                     const isTimeLike = /^\w+\s+mois\s+plus\s+tard$/.test(candidateTitle); // "Sept mois plus tard"
-                    
+
                     // Accept the first reasonable title we find
                     if (!isDateLike && !isTimeLike) {
                         title = candidateTitle;
@@ -436,7 +430,7 @@ async function classifyEpubContent(
         if (lowerText.includes('chapitre') || lowerText.includes('chapter')) patterns.push('chapter-marker');
 
         // Calibre-specific patterns
-        if (content.includes('class="chap_n"')) patterns.push('calibre-chapter-marker');
+        if (content.includes('class="chapn"')) patterns.push('calibre-chapter-marker');
         if (calibreChapterNumber !== undefined) patterns.push('calibre-numbered-chapter');
 
         // Structural epilogue/prologue headers (title-only pages)
@@ -493,7 +487,7 @@ async function classifyEpubContent(
         }
 
         // Special handling for items with prologue patterns
-        if (patterns.includes('prologue')) {
+        if (patterns.includes('prologue') || patterns.includes('prologue-header')) {
             mainContentStart = i;
             break;
         }
@@ -542,15 +536,54 @@ async function classifyEpubContent(
     // Analyze main content section for prologue, chapters, and epilogue
     const mainContentItems = spineWithAnalysis.slice(mainContentStart, mainContentEnd + 1);
 
-    // Check for prologue in main content
-    const firstMainItem = mainContentItems[0];
-    if (firstMainItem?.analysis.patterns.includes('prologue') || firstMainItem?.analysis.patterns.includes('prologue-header')) {
-        classification.prologue = {
-            id: firstMainItem.id,
-            href: firstMainItem.href,
-            title: firstMainItem.analysis.title
-        };
-        mainContentItems.shift(); // Remove from main content
+    // Check for prologue in main content (can be header + content or just content)
+    // Look for prologue header pattern first
+    let prologueFound = false;
+    for (let i = 0; i < Math.min(3, mainContentItems.length); i++) {
+        if (mainContentItems[i]?.analysis.patterns.includes('prologue-header')) {
+            // Found prologue header, check if next item exists and has substantial content
+            if (i + 1 < mainContentItems.length && 
+                mainContentItems[i + 1].analysis.hasSubstantialText &&
+                mainContentItems[i + 1].analysis.wordCount > 100) {
+                classification.prologue = {
+                    id: mainContentItems[i + 1].id,
+                    href: mainContentItems[i + 1].href,
+                    title: 'Prologue' // Override title for prologue content
+                };
+                // Remove both header and content from main content
+                mainContentItems.splice(i, 2);
+            } else {
+                // Check if this header item itself has substantial content
+                if (mainContentItems[i].analysis.hasSubstantialText && 
+                    mainContentItems[i].analysis.wordCount > 100) {
+                    // The header contains the content too
+                    classification.prologue = {
+                        id: mainContentItems[i].id,
+                        href: mainContentItems[i].href,
+                        title: 'Prologue' // Override title for prologue content
+                    };
+                    mainContentItems.splice(i, 1);
+                } else {
+                    // Just the header with no substantial content, skip it
+                    continue;
+                }
+            }
+            prologueFound = true;
+            break;
+        }
+    }
+
+    // If no prologue header found, check for direct prologue patterns
+    if (!prologueFound) {
+        const firstMainItem = mainContentItems[0];
+        if (firstMainItem?.analysis.patterns.includes('prologue')) {
+            classification.prologue = {
+                id: firstMainItem.id,
+                href: firstMainItem.href,
+                title: firstMainItem.analysis.title || 'Prologue'
+            };
+            mainContentItems.shift(); // Remove from main content
+        }
     }
 
     // Check for epilogue in main content (can be header + content or just content)
@@ -562,7 +595,7 @@ async function classifyEpubContent(
                 classification.epilogue = {
                     id: mainContentItems[i + 1].id,
                     href: mainContentItems[i + 1].href,
-                    title: mainContentItems[i + 1].analysis.title
+                    title: 'Epilogue' // Override title for epilogue content
                 };
                 // Remove both header and content from main content
                 mainContentItems.splice(i, 2);
@@ -571,7 +604,7 @@ async function classifyEpubContent(
                 classification.epilogue = {
                     id: mainContentItems[i].id,
                     href: mainContentItems[i].href,
-                    title: mainContentItems[i].analysis.title
+                    title: 'Epilogue' // Override title for epilogue header
                 };
                 mainContentItems.splice(i, 1);
             }
@@ -614,23 +647,23 @@ async function classifyEpubContent(
 
     // Process calibre-numbered chapters
     const sortedCalibreNumbers = Array.from(calibreChapterMap.keys()).sort((a, b) => a - b);
-    
+
     for (let i = 0; i < sortedCalibreNumbers.length; i++) {
         const calibreNum = sortedCalibreNumbers[i];
         const markerItem = calibreChapterMap.get(calibreNum)!;
-        
+
         // Check if this is just a chapter marker (minimal content) or actual chapter content
-        const isJustMarker = markerItem.analysis.wordCount < 200 && 
-                            markerItem.analysis.patterns.includes('calibre-chapter-marker');
-        
+        const isJustMarker = markerItem.analysis.wordCount < 200 &&
+            markerItem.analysis.patterns.includes('calibre-chapter-marker');
+
         if (isJustMarker) {
             // This is a chapter marker, look for the next unnumbered item as the content
-            const nextContentItem = unNumberedItems.find(item => 
-                item.originalIndex > markerItem.originalIndex && 
+            const nextContentItem = unNumberedItems.find(item =>
+                item.originalIndex > markerItem.originalIndex &&
                 item.analysis.hasSubstantialText &&
                 item.analysis.wordCount > 200
             );
-            
+
             if (nextContentItem) {
                 // Use the content item but with the calibre chapter number and title from marker
                 chapterItems.push({
@@ -639,20 +672,24 @@ async function classifyEpubContent(
                     title: markerItem.analysis.title || `[${calibreNum}]`, // Use marker title, fallback to [X]
                     chapterNumber: calibreNum
                 });
-                
+
                 // Remove the content item from unnumbered items to avoid double processing
                 const contentIndex = unNumberedItems.indexOf(nextContentItem);
                 if (contentIndex > -1) {
                     unNumberedItems.splice(contentIndex, 1);
                 }
             } else {
-                // No content found, use the marker itself
-                chapterItems.push({
-                    id: markerItem.id,
-                    href: markerItem.href,
-                    title: markerItem.analysis.title || `[${calibreNum}]`, // Use marker title, fallback to [X]
-                    chapterNumber: calibreNum
-                });
+                // No content found for this chapter marker - check if marker itself has substantial content
+                if (markerItem.analysis.hasSubstantialText && markerItem.analysis.wordCount > 100) {
+                    // Only include if the marker itself contains substantial content
+                    chapterItems.push({
+                        id: markerItem.id,
+                        href: markerItem.href,
+                        title: markerItem.analysis.title || `[${calibreNum}]`, // Use marker title, fallback to [X]
+                        chapterNumber: calibreNum
+                    });
+                }
+                // If marker has no substantial content, skip this chapter entirely
             }
         } else {
             // This item has both the marker and substantial content
@@ -680,7 +717,46 @@ async function classifyEpubContent(
 
     // Sort chapters by their calibre chapter number
     chapterItems.sort((a, b) => a.chapterNumber - b.chapterNumber);
-    classification.chapters = chapterItems;
+    
+    // Final filter: Remove any chapters that will result in empty content
+    // by checking actual content from entries for each chapter
+    const filteredChapterItems = await Promise.all(
+        chapterItems.map(async (chapterItem) => {
+            const entry = entries.find(e => e.fileName.includes(chapterItem.href) && !e.isDirectory);
+            if (!entry) return null;
+            
+            try {
+                const content = entry.content.toString('utf-8');
+                const textContent = content
+                    .replace(/<[^>]*>/g, ' ') // Remove HTML tags
+                    .replace(/\s+/g, ' ') // Normalize whitespace
+                    .trim();
+                
+                const wordCount = textContent.split(/\s+/).filter(word => word.length > 0).length;
+                
+                // Only include chapters with substantial content (more than just a chapter marker)
+                if (wordCount > 20) {  // Must have more than just a chapter marker
+                    return chapterItem;
+                }
+                
+                return null;
+            } catch (error) {
+                console.warn(`Warning: Could not verify content for chapter ${chapterItem.chapterNumber}`);
+                return chapterItem; // Keep on error to be safe
+            }
+        })
+    );
+    
+    // Filter out null values and renumber chapters sequentially
+    const validChapterItems = filteredChapterItems.filter(item => item !== null) as typeof chapterItems;
+    
+    // Renumber chapters to be sequential starting from 1
+    const finalChapterItems = validChapterItems.map((item, index) => ({
+        ...item,
+        chapterNumber: index + 1
+    }));
+    
+    classification.chapters = finalChapterItems;
 
     return classification;
 }
@@ -829,21 +905,21 @@ imported: ${new Date().toISOString().split('T')[0]}${coverFileName ? `\ncover: "
     if (contentClassification) {
         // Add chapters list with prologue and epilogue included
         obsidianNote += `\n## Table of Contents\n\n`;
-        
+
         // Add prologue if exists
         if (contentClassification.prologue) {
             const prologueTitle = contentClassification.prologue.title || 'Prologue';
             const prologueFileName = `${sanitizedTitle} - ${sanitizeFileName(prologueTitle)}`;
             obsidianNote += `**Prologue**: [[${prologueFileName}]]\n`;
         }
-        
+
         // Add all chapters
         contentClassification.chapters.forEach((chapter, index) => {
             const chapterNumber = chapter.chapterNumber || index + 1;
             const chapterFileName = `${sanitizedTitle} - Chapter ${chapterNumber}`;
             obsidianNote += `${chapterNumber}. [[${chapterFileName}]]\n`;
         });
-        
+
         // Add epilogue if exists
         if (contentClassification.epilogue) {
             const epilogueTitle = contentClassification.epilogue.title || 'Epilogue';
@@ -882,7 +958,9 @@ async function processChapterContent(
 
     // Process each chapter
     for (const chapter of contentClassification.chapters) {
-        const chapterTitle = chapter.title || `Chapter ${chapter.chapterNumber}`;
+        // Always use the sequential chapter number as title to ensure bijection
+        const chapterTitle = chapter.chapterNumber.toString();
+        
         await processContentFile(
             entries,
             chapter.href,
@@ -932,11 +1010,11 @@ async function processContentFile(
     try {
         const content = entry.content.toString('utf-8');
         const markdownContent = convertCalibreToMarkdown(content, title, type, chapterNumber, bookTitle);
-        
+
         // Generate proper filename based on type
         let noteFileName: string;
         const sanitizedBookTitle = sanitizeFileName(bookTitle || 'Book');
-        
+
         if (type === 'prologue') {
             noteFileName = `${sanitizedBookTitle} - Prologue.md`;
         } else if (type === 'epilogue') {
@@ -948,9 +1026,9 @@ async function processContentFile(
             const sanitizedTitle = sanitizeFileName(title);
             noteFileName = `${sanitizedTitle}.md`;
         }
-        
+
         const notePath = path.join(bookDir, noteFileName);
-        
+
         fs.writeFileSync(notePath, markdownContent);
         console.log(`📄 Generated ${type}: ${noteFileName}`);
     } catch (error) {
@@ -999,33 +1077,58 @@ function convertCalibreToMarkdown(
         .replace(/<\/body>/g, '') // Remove closing body tag
         .replace(/<div[^>]*class="exergues"[^>]*>/g, '') // Remove chapter container
         .replace(/<div[^>]*class="pagetitre"[^>]*><\/div>/g, '') // Remove page title divs
-        .replace(/<h1[^>]*class="chap_n"[^>]*>.*?<\/h1>/gs, '') // Remove chapter number headers
+        // Handle chapter number and title structure specially
+        .replace(/<h1[^>]*class="chapn"[^>]*>(.*?)<\/h1>/gs, '') // Remove chapter number headers (redundant with title)
+        .replace(/<h1[^>]*class="chap_n"[^>]*>(.*?)<\/h1>/gs, '') // Remove chapter number headers (Pandemia style, redundant with title)
+        .replace(/<h1[^>]*class="chaptit"[^>]*>(.*?)<\/h1>/gs, (match, content) => {
+            // Extract the chapter subtitle (like date)
+            const cleanContent = content.replace(/<[^>]*>/g, '').trim();
+            return `**${cleanContent}**\n\n`; // Make chapter subtitle bold
+        })
+        .replace(/<h2[^>]*class="int_niv"[^>]*>(.*?)<\/h2>/gs, (match, content) => {
+            // Extract the chapter subtitle (Pandemia style - like date)
+            const cleanContent = content.replace(/<[^>]*>/g, '').trim();
+            return `**${cleanContent}**\n\n`; // Make chapter subtitle bold
+        })
+        .replace(/<h1[^>]*class="prestit"[^>]*>(.*?)<\/h1>/gs, (match, content) => {
+            // Extract the prologue subtitle (like date)
+            const cleanContent = content.replace(/<[^>]*>/g, '').trim();
+            return `**${cleanContent}**\n\n`; // Make prologue subtitle bold
+        })
+        .replace(/<h1[^>]*class="pre_tit"[^>]*>(.*?)<\/h1>/gs, '') // Remove prologue title headers (Pandemia style, redundant with title)
         .replace(/<div[^>]*class="dev"[^>]*>/g, '') // Remove dev containers
-        .replace(/<\/div>/g, '') // Remove closing divs
+        .replace(/<\/div>/g, ''); // Remove closing divs
 
     // Convert calibre text classes to markdown
     textContent = textContent
         // Convert paragraph with first letter styling
-        .replace(/<p class="txt_courant_ssalinea"><span class="let">([^<]*)<\/span>([^<]*)<\/p>/g, '**$1**$2\n\n')
-        // Convert regular paragraphs
-        .replace(/<p class="txt_courant_[^"]*">([^<]*)<\/p>/g, '$1\n\n')
+        .replace(/<p class="txt_courant_ssalinea"><span class="let">(.*?)<\/span>(.*?)<\/p>/gs, '**$1**$2\n\n')
+        // Convert regular paragraphs (various patterns) - use non-greedy matching with dot-all
+        .replace(/<p class="txt_courant_[^"]*">(.*?)<\/p>/gs, '$1\n\n')
+        .replace(/<p class="txtcourant[^"]*">(.*?)<\/p>/gs, '$1\n\n')
+        .replace(/<p class="txtcourantjustif">(.*?)<\/p>/gs, '$1\n\n')
         // Convert justified paragraphs
-        .replace(/<p class="txt_courant_justif">([^<]*)<\/p>/g, '$1\n\n')
+        .replace(/<p class="txt_courant_justif">(.*?)<\/p>/gs, '$1\n\n')
+        // Convert generic paragraphs - make this more greedy to catch all paragraphs
+        .replace(/<p[^>]*>(.*?)<\/p>/gs, '$1\n\n')
         // Convert italic text
-        .replace(/<i class="calibre2">([^<]*)<\/i>/g, '*$1*')
+        .replace(/<i class="calibre2">(.*?)<\/i>/gs, '*$1*')
         // Remove page anchors (no longer needed per requirements)
-        .replace(/<a id="page_(\d+)" class="calibre4"><\/a>/g, '')
+        .replace(/<a id="page_(\d+)" class="calibre[^"]*"><\/a>/g, '')
+        .replace(/<a id="page_(\d+)" class="calibre\d+"><\/a>/g, '');
 
     // Handle special content blocks like letters
     textContent = textContent
         .replace(/<div class="lettre">/g, '\n> **Letter/Email:**\n> ')
-        .replace(/<\/div>/g, '\n\n')
+        .replace(/<\/div>/g, '\n\n');
 
     // Clean up remaining HTML tags
     textContent = textContent
         .replace(/<[^>]*>/g, '') // Remove any remaining HTML tags
         .replace(/&[^;]+;/g, '') // Remove HTML entities (basic cleanup)
         .replace(/\n\s*\n\s*\n/g, '\n\n') // Normalize multiple newlines
+        .replace(/^\s+/gm, '') // Remove leading whitespace/indentation from all lines
+        .replace(/(\d+)([A-ZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ][a-zàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ]+\s+\d{4})([A-ZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ])/g, '$1\n\n$2\n\n$3') // Fix date formatting: "32Novembre 2010La" -> "32\n\nNovembre 2010\n\nLa"
         .trim();
 
     markdown += textContent;
