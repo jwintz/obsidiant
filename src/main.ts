@@ -343,7 +343,7 @@ async function classifyEpubContent(
     } => {
         // Extract calibre chapter information from h1.chapn elements (do this first)
         const calibreChapterMatch = content.match(/<h1[^>]*class="chapn"[^>]*>(.*?)<\/h1>/s) ||
-                                   content.match(/<h1[^>]*class="chap_n"[^>]*>(.*?)<\/h1>/s);
+            content.match(/<h1[^>]*class="chap_n"[^>]*>(.*?)<\/h1>/s);
         let calibreChapterNumber: number | undefined;
         if (calibreChapterMatch) {
             // Extract just the number from the h1 content, ignoring HTML tags
@@ -542,7 +542,7 @@ async function classifyEpubContent(
     for (let i = 0; i < Math.min(3, mainContentItems.length); i++) {
         if (mainContentItems[i]?.analysis.patterns.includes('prologue-header')) {
             // Found prologue header, check if next item exists and has substantial content
-            if (i + 1 < mainContentItems.length && 
+            if (i + 1 < mainContentItems.length &&
                 mainContentItems[i + 1].analysis.hasSubstantialText &&
                 mainContentItems[i + 1].analysis.wordCount > 100) {
                 classification.prologue = {
@@ -554,7 +554,7 @@ async function classifyEpubContent(
                 mainContentItems.splice(i, 2);
             } else {
                 // Check if this header item itself has substantial content
-                if (mainContentItems[i].analysis.hasSubstantialText && 
+                if (mainContentItems[i].analysis.hasSubstantialText &&
                     mainContentItems[i].analysis.wordCount > 100) {
                     // The header contains the content too
                     classification.prologue = {
@@ -717,28 +717,28 @@ async function classifyEpubContent(
 
     // Sort chapters by their calibre chapter number
     chapterItems.sort((a, b) => a.chapterNumber - b.chapterNumber);
-    
+
     // Final filter: Remove any chapters that will result in empty content
     // by checking actual content from entries for each chapter
     const filteredChapterItems = await Promise.all(
         chapterItems.map(async (chapterItem) => {
             const entry = entries.find(e => e.fileName.includes(chapterItem.href) && !e.isDirectory);
             if (!entry) return null;
-            
+
             try {
                 const content = entry.content.toString('utf-8');
                 const textContent = content
                     .replace(/<[^>]*>/g, ' ') // Remove HTML tags
                     .replace(/\s+/g, ' ') // Normalize whitespace
                     .trim();
-                
+
                 const wordCount = textContent.split(/\s+/).filter(word => word.length > 0).length;
-                
+
                 // Only include chapters with substantial content (more than just a chapter marker)
                 if (wordCount > 20) {  // Must have more than just a chapter marker
                     return chapterItem;
                 }
-                
+
                 return null;
             } catch (error) {
                 console.warn(`Warning: Could not verify content for chapter ${chapterItem.chapterNumber}`);
@@ -746,16 +746,16 @@ async function classifyEpubContent(
             }
         })
     );
-    
+
     // Filter out null values and renumber chapters sequentially
     const validChapterItems = filteredChapterItems.filter(item => item !== null) as typeof chapterItems;
-    
+
     // Renumber chapters to be sequential starting from 1
     const finalChapterItems = validChapterItems.map((item, index) => ({
         ...item,
         chapterNumber: index + 1
     }));
-    
+
     classification.chapters = finalChapterItems;
 
     return classification;
@@ -960,7 +960,7 @@ async function processChapterContent(
     for (const chapter of contentClassification.chapters) {
         // Always use the sequential chapter number as title to ensure bijection
         const chapterTitle = chapter.chapterNumber.toString();
-        
+
         await processContentFile(
             entries,
             chapter.href,
@@ -1127,7 +1127,7 @@ function convertCalibreToMarkdown(
         .replace(/<[^>]*>/g, '') // Remove any remaining HTML tags
         .replace(/&[^;]+;/g, '') // Remove HTML entities (basic cleanup)
         .replace(/\n\s*\n\s*\n/g, '\n\n') // Normalize multiple newlines
-        .replace(/^\s+/gm, '') // Remove leading whitespace/indentation from all lines
+        .replace(/^[ \t]+/gm, '') // Remove leading whitespace/indentation from lines with content (but preserve blank lines)
         .replace(/(\d+)([A-ZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ][a-zàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ]+\s+\d{4})([A-ZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ])/g, '$1\n\n$2\n\n$3') // Fix date formatting: "32Novembre 2010La" -> "32\n\nNovembre 2010\n\nLa"
         .trim();
 
