@@ -315,9 +315,91 @@ async function parseEpubMetadata(entries: Array<{ fileName: string; content: Buf
 interface ContentClassification {
     frontMatter: Array<{ id: string; href: string; title?: string; }>;
     prologue?: { id: string; href: string; title?: string; };
-    chapters: Array<{ id: string; href: string; title?: string; chapterNumber: number; }>;
+    chapters: Array<{ id: string; href: string; title?: string; chapterNumber: number; partNumber?: number; partTitle?: string; content?: string; }>;
     epilogue?: { id: string; href: string; title?: string; };
     backMatter: Array<{ id: string; href: string; title?: string; }>;
+}
+
+function extractInternalChapters(content: string, item: any, partNumber: number, partTitle: string): any[] {
+    const chapters: any[] = [];
+
+    console.log(`    🔍 Extracting chapters from ${item.href}...`);
+
+    // Look for <h1 class="level1_title"> markers which indicate chapter boundaries
+    const chapterPattern = /<h1[^>]*class="[^"]*level1_title[^"]*"[^>]*>(.*?)<\/h1>/gi;
+    const matches = Array.from(content.matchAll(chapterPattern));
+
+    console.log(`    📊 Found ${matches.length} internal chapters`);
+
+    if (matches.length === 0) {
+        return []; // No internal chapters found
+    }
+
+    // For this multipart book format, numbered chapters "1.", "2.", etc. ARE legitimate chapter titles
+    // Only filter out if there are both numbered (1., 2.) AND named chapters (Chapter 1, etc.) 
+    // and the numbered ones are clearly subsections
+    const numberedTitles = matches.filter(m => /^\d+\.$/.test(m[1].trim()));
+    const namedTitles = matches.filter(m => !/^\d+\.$/.test(m[1].trim()));
+
+    let validChapterMatches = matches;
+
+    // Only filter out numbered titles if we have substantial named titles that suggest
+    // the numbered ones are subsections
+    if (namedTitles.length > numberedTitles.length / 2) {
+        console.log(`    🔄 Filtering out ${numberedTitles.length} numbered subsections, keeping ${namedTitles.length} named chapters`);
+        validChapterMatches = namedTitles;
+        for (const match of numberedTitles) {
+            console.log(`    🔄 Skipping numbered subsection: "${match[1].trim()}"`);
+        }
+    } else {
+        console.log(`    ✅ Keeping all ${matches.length} chapters (numbered chapters appear to be legitimate)`);
+    }
+
+    console.log(`    📊 Found ${validChapterMatches.length} valid chapters after filtering`);
+
+    if (validChapterMatches.length === 0) {
+        return []; // No valid chapters found after filtering
+    }
+
+    // Split content by actual chapter markers - include numbered chapters if they're legitimate
+    const actualChapterPattern = validChapterMatches === matches
+        ? /<h1[^>]*class="[^"]*level1_title[^"]*"[^>]*>(.*?)<\/h1>/gi  // Include all if numbered are legitimate
+        : /<h1[^>]*class="[^"]*level1_title[^"]*"[^>]*>(?!\d+\.)(.*?)<\/h1>/gi; // Exclude numbered if they're subsections
+    const chapterSections = content.split(actualChapterPattern);
+
+    console.log(`    📄 Split into ${chapterSections.length} sections`);
+
+    // The split creates an array where odd indices contain the titles and even indices contain the content
+    // chapterSections[0] is content before first chapter
+    // chapterSections[1] is first chapter title, chapterSections[2] is first chapter content
+    // chapterSections[3] is second chapter title, chapterSections[4] is second chapter content, etc.
+
+    for (let i = 1; i < chapterSections.length; i += 2) {
+        if (i + 1 < chapterSections.length) {
+            const chapterTitle = chapterSections[i].trim();
+            const chapterContent = chapterSections[i + 1];
+            const chapterIndex = Math.floor(i / 2) + 1;
+
+            console.log(`    📖 Chapter ${chapterIndex}: "${chapterTitle}"`);
+
+            // Extract chapter number from title if possible (e.g., "1. Chapter Title" or "Chapter 1")
+            const numberMatch = chapterTitle.match(/^\d+/) || chapterTitle.match(/chapitre\s+(\d+)/i) || chapterTitle.match(/chapter\s+(\d+)/i);
+            const chapterNumber = numberMatch ? parseInt(numberMatch[0]) : chapterIndex;
+
+            chapters.push({
+                id: `${item.id}_ch${chapterNumber}`,
+                href: item.href,
+                title: chapterTitle || `Chapter ${chapterNumber}`,
+                chapterNumber: chapterNumber,
+                partNumber: partNumber,
+                partTitle: partTitle,
+                content: chapterContent
+            });
+        }
+    }
+
+    console.log(`    ✅ Extracted ${chapters.length} chapters from ${item.href}`);
+    return chapters;
 }
 
 /**
@@ -334,23 +416,68 @@ async function classifyEpubContent(
     };
 
     // Extract title and analyze content patterns
-    const analyzeContent = (content: string): {
+    const analyzeContent = (content: string, fileName?: string): {
         title?: string;
         hasSubstantialText: boolean;
         patterns: string[];
         wordCount: number;
-        calibreChapterNumber?: number;
+        chapterNumber?: number;
+        partNumber?: number;
+        partTitle?: string;
     } => {
         // Extract calibre chapter information from h1.chapn elements (do this first)
         const calibreChapterMatch = content.match(/<h1[^>]*class="chapn"[^>]*>(.*?)<\/h1>/s) ||
             content.match(/<h1[^>]*class="chap_n"[^>]*>(.*?)<\/h1>/s);
-        let calibreChapterNumber: number | undefined;
+        let chapterNumber: number | undefined;
         if (calibreChapterMatch) {
             // Extract just the number from the h1 content, ignoring HTML tags
             const h1Text = calibreChapterMatch[1].replace(/<[^>]*>/g, '').trim();
             // Handle both plain numbers (31) and bracketed numbers ([1])
             const numberMatch = h1Text.match(/^(\d+)$/) || h1Text.match(/^\[(\d+)\]$/);
-            calibreChapterNumber = numberMatch ? parseInt(numberMatch[1]) : undefined;
+            chapterNumber = numberMatch ? parseInt(numberMatch[1]) : undefined;
+        }
+
+        // Extract part information from part headers
+        let partNumber: number | undefined;
+        let partTitle: string | undefined;
+
+        // Check filename for part patterns (like c05_part_cut1.xhtml, c06_part_cut1.xhtml)
+        if (fileName) {
+            const filePartMatch = fileName.match(/c(\d+)_part_cut(\d+)\.xhtml/);
+            if (filePartMatch) {
+                partNumber = parseInt(filePartMatch[1]);
+                partTitle = `Part ${partNumber}`;
+                console.log(`📁 Found part from filename: ${fileName} -> Part ${partNumber}`);
+            }
+        }
+
+        // Look for part headers with patterns like "PARTIE 1" and part titles
+        const partNumberMatch = content.match(/<h1[^>]*class="part_number"[^>]*>.*?(\d+).*?<\/h1>/is);
+        const partTitleMatch = content.match(/<h2[^>]*class="part_title"[^>]*>(.*?)<\/h2>/is);
+
+        // Look for part headers in content (language-agnostic)
+        const partHeaderMatch = content.match(/<h[1-3][^>]*>(.*?)<\/h[1-3]>/is);
+
+        if (partHeaderMatch) {
+            const headerText = partHeaderMatch[1].replace(/<[^>]*>/g, '').trim();
+            console.log(`🔍 Found header text: "${headerText}"`);
+
+            // Try to extract any number from the header text (language-agnostic)
+            const numberMatch = headerText.match(/(\d+)/);
+            if (numberMatch) {
+                // Don't use this number directly - it will be remapped later
+                // Just mark that this is a part header
+                partTitle = headerText;
+                console.log(`� Found part header: "${headerText}"`);
+            }
+        }
+
+        if (partNumberMatch) {
+            partNumber = parseInt(partNumberMatch[1]);
+        }
+
+        if (partTitleMatch) {
+            partTitle = partTitleMatch[1].replace(/<[^>]*>/g, '').trim();
         }
 
         // Extract title from various sources, but be smart about it
@@ -382,8 +509,8 @@ async function classifyEpubContent(
         let title: string | undefined;
 
         // Priority 1: If we have a calibre chapter number, use it directly as the title
-        if (calibreChapterNumber !== undefined) {
-            title = calibreChapterNumber.toString();
+        if (chapterNumber !== undefined) {
+            title = chapterNumber.toString();
         }
         // Priority 2: For structural content (epilogue/prologue), use generic titles
         else if (isEpilogue) {
@@ -428,37 +555,46 @@ async function classifyEpubContent(
         if (lowerText.match(/^(prologue|préface|avant-propos|introduction)/)) patterns.push('prologue');
         if (lowerText.match(/^(epilogue|épilogue|conclusion|postface)/)) patterns.push('epilogue');
         if (lowerText.includes('chapitre') || lowerText.includes('chapter')) patterns.push('chapter-marker');
+        if (lowerText.match(/^(remerciements|acknowledgments?|thanks)/)) patterns.push('acknowledgment');
+        if (lowerText.match(/^(bibliographie|bibliography|références|references)/)) patterns.push('bibliography');
+        if (lowerText.match(/^(index|table des matières alphabétique)/)) patterns.push('index');
 
         // Calibre-specific patterns
         if (content.includes('class="chapn"')) patterns.push('calibre-chapter-marker');
-        if (calibreChapterNumber !== undefined) patterns.push('calibre-numbered-chapter');
+        if (chapterNumber !== undefined) patterns.push('calibre-numbered-chapter');
 
         // Structural epilogue/prologue headers (title-only pages)
         if (lowerContent.includes('<h1') && lowerContent.includes('épilogue')) patterns.push('epilogue-header');
         if (lowerContent.includes('<h1') && lowerContent.includes('prologue')) patterns.push('prologue-header');
 
+        // Part-specific patterns
+        if (partNumber !== undefined) patterns.push('part-header');
+        if (content.includes('class="part_number"') || content.includes('class="part_title"')) patterns.push('part-marker');
+
         // Image-heavy content (likely front matter)
         const imageCount = (content.match(/<img[^>]*>/g) || []).length;
         if (imageCount > 0 && wordCount < 20) patterns.push('image-heavy');
 
-        return { title, hasSubstantialText, patterns, wordCount, calibreChapterNumber };
+        return { title, hasSubstantialText, patterns, wordCount, chapterNumber, partNumber, partTitle };
     };
 
     // Analyze each spine item
     const spineWithAnalysis = await Promise.all(spine.map(async (spineItem, index) => {
         const entry = entries.find(e => e.fileName.includes(spineItem.href) && !e.isDirectory);
-        let analysis = { title: undefined as string | undefined, hasSubstantialText: false, patterns: [] as string[], wordCount: 0, calibreChapterNumber: undefined as number | undefined };
+        let analysis = { title: undefined as string | undefined, hasSubstantialText: false, patterns: [] as string[], wordCount: 0, chapterNumber: undefined as number | undefined, partNumber: undefined as number | undefined, partTitle: undefined as string | undefined };
 
         if (entry) {
             try {
                 const content = entry.content.toString('utf-8');
-                const contentAnalysis = analyzeContent(content);
+                const contentAnalysis = analyzeContent(content, entry.fileName);
                 analysis = {
                     title: contentAnalysis.title,
                     hasSubstantialText: contentAnalysis.hasSubstantialText,
                     patterns: contentAnalysis.patterns,
                     wordCount: contentAnalysis.wordCount,
-                    calibreChapterNumber: contentAnalysis.calibreChapterNumber
+                    chapterNumber: contentAnalysis.chapterNumber,
+                    partNumber: contentAnalysis.partNumber,
+                    partTitle: contentAnalysis.partTitle
                 };
             } catch (error) {
                 console.warn(`Warning: Could not read content from ${spineItem.href}`);
@@ -501,7 +637,7 @@ async function classifyEpubContent(
         // If this item has substantial content and no back matter patterns, main content ends here
         if (hasSubstantialText &&
             wordCount > 200 &&
-            !patterns.some(p => ['epilogue', 'acknowledgment', 'bibliography', 'index'].includes(p))) {
+            !patterns.some(p => ['epilogue', 'acknowledgment', 'bibliography', 'index', 'thanks', 'references'].includes(p))) {
             mainContentEnd = i;
             break;
         }
@@ -625,101 +761,217 @@ async function classifyEpubContent(
         }
     }
 
-    // Remaining items are chapters - handle calibre numbering and content pairing
+    // Remaining items are chapters - handle calibre numbering, parts, and content pairing
     const chapterItems: Array<{
         id: string;
         href: string;
         title?: string;
         chapterNumber: number;
+        partNumber?: number;
+        partTitle?: string;
     }> = [];
 
-    // Build a map of calibre chapter numbers to items
-    const calibreChapterMap = new Map<number, typeof mainContentItems[0]>();
-    const unNumberedItems: typeof mainContentItems = [];
+    // Track part number mapping for multipart books
+    let partNumberMapping = new Map<number, number>();
 
-    for (const item of mainContentItems) {
-        if (item.analysis.calibreChapterNumber !== undefined) {
-            calibreChapterMap.set(item.analysis.calibreChapterNumber, item);
-        } else {
-            unNumberedItems.push(item);
+    console.log(`🔍 mainContentItems.length: ${mainContentItems.length}`);
+    mainContentItems.forEach((item, index) => {
+        console.log(`  ${index}: ${item.href} - patterns: [${item.analysis.patterns.join(', ')}] - wordCount: ${item.analysis.wordCount}`);
+    });
+
+    // Detect if this is a multipart book by looking for part headers
+    const partHeaders = mainContentItems.filter(item => item.analysis.patterns.includes('part-header'));
+    const isMultipartBook = partHeaders.length > 0;
+
+    if (isMultipartBook) {
+        console.log(`📚 Detected multipart book with ${partHeaders.length} parts`);
+
+        // Group part headers with their content files
+        // In this format, part headers are like c05_part_cut1.xhtml and content is c05_part_cut2.xhtml
+        const originalPartGroups = new Map<number, { header: any, contentFiles: any[]; }>();
+
+        for (const partHeader of partHeaders) {
+            const originalPartNum = partHeader.analysis.partNumber!;
+            if (!originalPartGroups.has(originalPartNum)) {
+                originalPartGroups.set(originalPartNum, { header: partHeader, contentFiles: [] });
+            }
+
+            // Determine if this is a header file (small word count) or content file (large word count)
+            if (partHeader.analysis.wordCount < 100) {
+                // This is likely a part header file
+                originalPartGroups.get(originalPartNum)!.header = partHeader;
+            } else {
+                // This is likely a content file for this part
+                originalPartGroups.get(originalPartNum)!.contentFiles.push(partHeader);
+            }
         }
-    }
 
-    // Process calibre-numbered chapters
-    const sortedCalibreNumbers = Array.from(calibreChapterMap.keys()).sort((a, b) => a - b);
+        // Create a mapping from original part numbers to sequential part numbers (1, 2, 3, ...)
+        // Only include parts that have content files
+        const partsWithContent = Array.from(originalPartGroups.entries())
+            .filter(([partNum, partGroup]) => partGroup.contentFiles.length > 0)
+            .map(([partNum]) => partNum)
+            .sort((a, b) => a - b);
 
-    for (let i = 0; i < sortedCalibreNumbers.length; i++) {
-        const calibreNum = sortedCalibreNumbers[i];
-        const markerItem = calibreChapterMap.get(calibreNum)!;
+        partNumberMapping = new Map<number, number>();
+        partsWithContent.forEach((originalPartNum, index) => {
+            partNumberMapping.set(originalPartNum, index + 1);
+        });
 
-        // Check if this is just a chapter marker (minimal content) or actual chapter content
-        const isJustMarker = markerItem.analysis.wordCount < 200 &&
-            markerItem.analysis.patterns.includes('calibre-chapter-marker');
+        console.log(`📝 Part number mapping: ${Array.from(partNumberMapping.entries()).map(([orig, seq]) => `${orig}→${seq}`).join(', ')}`);
 
-        if (isJustMarker) {
-            // This is a chapter marker, look for the next unnumbered item as the content
-            const nextContentItem = unNumberedItems.find(item =>
-                item.originalIndex > markerItem.originalIndex &&
-                item.analysis.hasSubstantialText &&
-                item.analysis.wordCount > 200
-            );
+        // Remap part groups to use sequential part numbers
+        const partGroups = new Map<number, { header: any, contentFiles: any[]; }>();
+        for (const [originalPartNum, partGroup] of originalPartGroups) {
+            const sequentialPartNum = partNumberMapping.get(originalPartNum)!;
+            partGroups.set(sequentialPartNum, partGroup);
+        }
 
-            if (nextContentItem) {
-                // Use the content item but with the calibre chapter number and title from marker
-                chapterItems.push({
-                    id: nextContentItem.id,
-                    href: nextContentItem.href,
-                    title: markerItem.analysis.title || `[${calibreNum}]`, // Use marker title, fallback to [X]
-                    chapterNumber: calibreNum
-                });
+        // Process each part
+        for (const [partNumber, partGroup] of partGroups) {
+            const partTitle = partGroup.header?.analysis.partTitle || `Part ${partNumber}`;
+            console.log(`  📖 Part ${partNumber}: "${partTitle}" (${partGroup.contentFiles.length} content files)`);
 
-                // Remove the content item from unnumbered items to avoid double processing
-                const contentIndex = unNumberedItems.indexOf(nextContentItem);
-                if (contentIndex > -1) {
-                    unNumberedItems.splice(contentIndex, 1);
+            // Process each content file in this part
+            for (const item of partGroup.contentFiles) {
+                console.log(`      🔍 Processing content file: ${item.href}`);
+                console.log(`        - Patterns: ${item.analysis.patterns.join(', ')}`);
+                console.log(`        - Has substantial text: ${item.analysis.hasSubstantialText}`);
+                console.log(`        - Word count: ${item.analysis.wordCount}`);
+
+                // Skip if doesn't have substantial content
+                if (!item.analysis.hasSubstantialText || item.analysis.wordCount < 200) {
+                    console.log(`        ⏭️ Skipping content file: ${item.href}`);
+                    continue;
+                }
+
+                // Look for internal chapter markers
+                console.log(`      🔍 Looking for entry with href: ${item.href}`);
+                const entry = entries.find(e => e.fileName.includes(item.href) && !e.isDirectory);
+                console.log(`      ${entry ? '✅' : '❌'} Entry ${entry ? 'found' : 'not found'}: ${entry?.fileName || 'N/A'}`);
+
+                if (entry) {
+                    try {
+                        const content = entry.content.toString('utf-8');
+                        console.log(`      📄 Content length: ${content.length} characters`);
+
+                        // Extract individual chapters from the content
+                        const internalChapters = extractInternalChapters(content, item, partNumber, partTitle);
+
+                        if (internalChapters.length > 0) {
+                            // Add all internal chapters
+                            for (const internalChapter of internalChapters) {
+                                chapterItems.push(internalChapter);
+                            }
+                        } else {
+                            // Fallback: treat the entire file as a single chapter
+                            chapterItems.push({
+                                id: item.id,
+                                href: item.href,
+                                title: item.analysis.title || `1`,
+                                chapterNumber: 1, // Will be renumbered later
+                                partNumber: partNumber,
+                                partTitle: partTitle
+                            });
+                        }
+                    } catch (error) {
+                        console.warn(`Warning: Could not extract chapters from ${item.href}: ${error}`);
+                    }
+                }
+            }
+        }
+    } else {
+        // Single-part book: use the existing logic
+        // Build a map of chapter numbers to items
+        const chapterMap = new Map<number, typeof mainContentItems[0]>();
+        const unNumberedItems: typeof mainContentItems = [];
+
+        for (const item of mainContentItems) {
+            if (item.analysis.chapterNumber !== undefined) {
+                chapterMap.set(item.analysis.chapterNumber, item);
+            } else {
+                unNumberedItems.push(item);
+            }
+        }
+
+        // Process numbered chapters
+        const sortedChapterNumbers = Array.from(chapterMap.keys()).sort((a, b) => a - b);
+
+        for (let i = 0; i < sortedChapterNumbers.length; i++) {
+            const chapterNum = sortedChapterNumbers[i];
+            const markerItem = chapterMap.get(chapterNum)!;
+
+            // Check if this is just a chapter marker (minimal content) or actual chapter content
+            const isJustMarker = markerItem.analysis.wordCount < 200 &&
+                markerItem.analysis.patterns.includes('calibre-chapter-marker');
+
+            if (isJustMarker) {
+                // This is a chapter marker, look for the next unnumbered item as the content
+                const nextContentItem = unNumberedItems.find(item =>
+                    item.originalIndex > markerItem.originalIndex &&
+                    item.analysis.hasSubstantialText &&
+                    item.analysis.wordCount > 200
+                );
+
+                if (nextContentItem) {
+                    // Use the content item but with the chapter number and title from marker
+                    chapterItems.push({
+                        id: nextContentItem.id,
+                        href: nextContentItem.href,
+                        title: markerItem.analysis.title || `[${chapterNum}]`, // Use marker title, fallback to [X]
+                        chapterNumber: chapterNum
+                    });
+
+                    // Remove the content item from unnumbered items to avoid double processing
+                    const contentIndex = unNumberedItems.indexOf(nextContentItem);
+                    if (contentIndex > -1) {
+                        unNumberedItems.splice(contentIndex, 1);
+                    }
+                } else {
+                    // No content found for this chapter marker - check if marker itself has substantial content
+                    if (markerItem.analysis.hasSubstantialText && markerItem.analysis.wordCount > 100) {
+                        // Only include if the marker itself contains substantial content
+                        chapterItems.push({
+                            id: markerItem.id,
+                            href: markerItem.href,
+                            title: markerItem.analysis.title || `[${chapterNum}]`, // Use marker title, fallback to [X]
+                            chapterNumber: chapterNum
+                        });
+                    }
+                    // If marker has no substantial content, skip this chapter entirely
                 }
             } else {
-                // No content found for this chapter marker - check if marker itself has substantial content
-                if (markerItem.analysis.hasSubstantialText && markerItem.analysis.wordCount > 100) {
-                    // Only include if the marker itself contains substantial content
-                    chapterItems.push({
-                        id: markerItem.id,
-                        href: markerItem.href,
-                        title: markerItem.analysis.title || `[${calibreNum}]`, // Use marker title, fallback to [X]
-                        chapterNumber: calibreNum
-                    });
-                }
-                // If marker has no substantial content, skip this chapter entirely
+                // This item has both the marker and substantial content
+                chapterItems.push({
+                    id: markerItem.id,
+                    href: markerItem.href,
+                    title: markerItem.analysis.title,
+                    chapterNumber: chapterNum
+                });
             }
-        } else {
-            // This item has both the marker and substantial content
-            chapterItems.push({
-                id: markerItem.id,
-                href: markerItem.href,
-                title: markerItem.analysis.title,
-                chapterNumber: calibreNum
-            });
         }
+
+        // Handle any remaining unnumbered items as additional chapters
+        let nextChapterNumber = sortedChapterNumbers.length > 0 ? Math.max(...sortedChapterNumbers) + 1 : 1;
+        for (const item of unNumberedItems) {
+            if (item.analysis.hasSubstantialText && item.analysis.wordCount > 200) {
+                chapterItems.push({
+                    id: item.id,
+                    href: item.href,
+                    title: item.analysis.title,
+                    chapterNumber: nextChapterNumber++
+                });
+            }
+        }
+
+        // Sort chapters by their chapter number
+        chapterItems.sort((a, b) => a.chapterNumber - b.chapterNumber);
+
+        // Note: Part numbers should already be sequential (1, 2, 3...) from the remapped partGroups processing
+
     }
 
-    // Handle any remaining unnumbered items as additional chapters
-    let nextChapterNumber = sortedCalibreNumbers.length > 0 ? Math.max(...sortedCalibreNumbers) + 1 : 1;
-    for (const item of unNumberedItems) {
-        if (item.analysis.hasSubstantialText && item.analysis.wordCount > 200) {
-            chapterItems.push({
-                id: item.id,
-                href: item.href,
-                title: item.analysis.title,
-                chapterNumber: nextChapterNumber++
-            });
-        }
-    }
-
-    // Sort chapters by their calibre chapter number
-    chapterItems.sort((a, b) => a.chapterNumber - b.chapterNumber);
-
-    // Final filter: Remove any chapters that will result in empty content
-    // by checking actual content from entries for each chapter
+    // Final filter and processing for both multipart and single-part books
     const filteredChapterItems = await Promise.all(
         chapterItems.map(async (chapterItem) => {
             const entry = entries.find(e => e.fileName.includes(chapterItem.href) && !e.isDirectory);
@@ -750,11 +1002,18 @@ async function classifyEpubContent(
     // Filter out null values and renumber chapters sequentially
     const validChapterItems = filteredChapterItems.filter(item => item !== null) as typeof chapterItems;
 
-    // Renumber chapters to be sequential starting from 1
-    const finalChapterItems = validChapterItems.map((item, index) => ({
-        ...item,
-        chapterNumber: index + 1
-    }));
+    // For single-part books, renumber chapters to be sequential starting from 1
+    // For multipart books, keep the part-based numbering
+    let finalChapterItems: typeof chapterItems;
+    if (isMultipartBook) {
+        finalChapterItems = validChapterItems; // Keep original numbering within parts
+    } else {
+        // Renumber chapters to be sequential starting from 1 for single-part books
+        finalChapterItems = validChapterItems.map((item, index) => ({
+            ...item,
+            chapterNumber: index + 1
+        }));
+    }
 
     classification.chapters = finalChapterItems;
 
@@ -913,12 +1172,39 @@ imported: ${new Date().toISOString().split('T')[0]}${coverFileName ? `\ncover: "
             obsidianNote += `**Prologue**: [[${prologueFileName}]]\n`;
         }
 
-        // Add all chapters
-        contentClassification.chapters.forEach((chapter, index) => {
-            const chapterNumber = chapter.chapterNumber || index + 1;
-            const chapterFileName = `${sanitizedTitle} - Chapter ${chapterNumber}`;
-            obsidianNote += `${chapterNumber}. [[${chapterFileName}]]\n`;
-        });
+        // Check if this is a multipart book
+        const isMultipart = contentClassification.chapters.some(chapter => chapter.partNumber !== undefined);
+
+        if (isMultipart) {
+            // Group chapters by part for multipart books
+            const partGroups = new Map<number, typeof contentClassification.chapters>();
+            contentClassification.chapters.forEach(chapter => {
+                const partNum = chapter.partNumber || 1;
+                if (!partGroups.has(partNum)) {
+                    partGroups.set(partNum, []);
+                }
+                partGroups.get(partNum)!.push(chapter);
+            });
+
+            // Generate ToC by parts
+            for (const [partNumber, chapters] of partGroups) {
+                const partTitle = chapters[0]?.partTitle || `Part ${partNumber}`;
+                obsidianNote += `\n### ${partTitle}\n\n`;
+
+                chapters.forEach(chapter => {
+                    const chapterNumber = chapter.chapterNumber;
+                    const chapterFileName = `${sanitizedTitle} - Part ${partNumber} - Chapter ${chapterNumber}`;
+                    obsidianNote += `${chapterNumber}. [[${chapterFileName}]]\n`;
+                });
+            }
+        } else {
+            // Single-part book - use simple numbering
+            contentClassification.chapters.forEach((chapter, index) => {
+                const chapterNumber = chapter.chapterNumber || index + 1;
+                const chapterFileName = `${sanitizedTitle} - Chapter ${chapterNumber}`;
+                obsidianNote += `${chapterNumber}. [[${chapterFileName}]]\n`;
+            });
+        }
 
         // Add epilogue if exists
         if (contentClassification.epilogue) {
@@ -961,15 +1247,37 @@ async function processChapterContent(
         // Always use the sequential chapter number as title to ensure bijection
         const chapterTitle = chapter.chapterNumber.toString();
 
-        await processContentFile(
-            entries,
-            chapter.href,
-            chapterTitle,
-            bookDir,
-            'chapter',
-            chapter.chapterNumber,
-            bookTitle
-        );
+        // Check if this chapter has specific content (from internal chapter extraction)
+        console.log(`🔍 Chapter ${chapter.chapterNumber}: content property exists: ${'content' in chapter}, content type: ${typeof chapter.content}, content length: ${chapter.content ? chapter.content.length : 'N/A'}`);
+
+        if ('content' in chapter && typeof chapter.content === 'string' && chapter.content) {
+            console.log(`✅ Using processChapterWithContent for chapter ${chapter.chapterNumber}`);
+            // Use the extracted chapter content directly
+            await processChapterWithContent(
+                chapter.content,
+                chapterTitle,
+                bookDir,
+                'chapter',
+                chapter.chapterNumber,
+                bookTitle,
+                chapter.partNumber,
+                chapter.partTitle
+            );
+        } else {
+            console.log(`❌ Using processContentFile for chapter ${chapter.chapterNumber}`);
+            // Use the original file processing for chapters without specific content
+            await processContentFile(
+                entries,
+                chapter.href,
+                chapterTitle,
+                bookDir,
+                'chapter',
+                chapter.chapterNumber,
+                bookTitle,
+                chapter.partNumber,
+                chapter.partTitle
+            );
+        }
     }
 
     // Process epilogue if exists
@@ -989,27 +1297,20 @@ async function processChapterContent(
 }
 
 /**
- * Process a single content file and convert to Obsidian Markdown
+ * Process a chapter with specific content (for internally extracted chapters)
  */
-async function processContentFile(
-    entries: Array<{ fileName: string; content: Buffer; isDirectory: boolean; }>,
-    href: string,
+async function processChapterWithContent(
+    content: string,
     title: string,
     bookDir: string,
     type: 'prologue' | 'chapter' | 'epilogue',
     chapterNumber?: number,
-    bookTitle?: string
+    bookTitle?: string,
+    partNumber?: number,
+    partTitle?: string
 ): Promise<void> {
-    // Find the content entry
-    const entry = entries.find(e => e.fileName.includes(href) && !e.isDirectory);
-    if (!entry) {
-        console.warn(`⚠️ Content file not found: ${href}`);
-        return;
-    }
-
     try {
-        const content = entry.content.toString('utf-8');
-        const markdownContent = convertCalibreToMarkdown(content, title, type, chapterNumber, bookTitle);
+        const markdownContent = convertCalibreToMarkdown(content, title, type, chapterNumber, bookTitle, partNumber, partTitle);
 
         // Generate proper filename based on type
         let noteFileName: string;
@@ -1020,7 +1321,67 @@ async function processContentFile(
         } else if (type === 'epilogue') {
             noteFileName = `${sanitizedBookTitle} - Epilogue.md`;
         } else if (type === 'chapter' && chapterNumber) {
-            noteFileName = `${sanitizedBookTitle} - Chapter ${chapterNumber}.md`;
+            if (partNumber && partTitle) {
+                // For multipart books, include part information in filename with "-" separator
+                noteFileName = `${sanitizedBookTitle} - Part ${partNumber} - Chapter ${chapterNumber}.md`;
+            } else {
+                noteFileName = `${sanitizedBookTitle} - Chapter ${chapterNumber}.md`;
+            }
+        } else {
+            // Fallback
+            const sanitizedTitle = sanitizeFileName(title);
+            noteFileName = `${sanitizedTitle}.md`;
+        }
+
+        const notePath = path.join(bookDir, noteFileName);
+
+        fs.writeFileSync(notePath, markdownContent);
+        console.log(`📄 Generated ${type}: ${noteFileName}`);
+    } catch (error) {
+        console.error(`❌ Error processing chapter content:`, error);
+    }
+}
+
+/**
+ * Process a single content file and convert to Obsidian Markdown
+ */
+async function processContentFile(
+    entries: Array<{ fileName: string; content: Buffer; isDirectory: boolean; }>,
+    href: string,
+    title: string,
+    bookDir: string,
+    type: 'prologue' | 'chapter' | 'epilogue',
+    chapterNumber?: number,
+    bookTitle?: string,
+    partNumber?: number,
+    partTitle?: string
+): Promise<void> {
+    // Find the content entry
+    const entry = entries.find(e => e.fileName.includes(href) && !e.isDirectory);
+    if (!entry) {
+        console.warn(`⚠️ Content file not found: ${href}`);
+        return;
+    }
+
+    try {
+        const content = entry.content.toString('utf-8');
+        const markdownContent = convertCalibreToMarkdown(content, title, type, chapterNumber, bookTitle, partNumber, partTitle);
+
+        // Generate proper filename based on type
+        let noteFileName: string;
+        const sanitizedBookTitle = sanitizeFileName(bookTitle || 'Book');
+
+        if (type === 'prologue') {
+            noteFileName = `${sanitizedBookTitle} - Prologue.md`;
+        } else if (type === 'epilogue') {
+            noteFileName = `${sanitizedBookTitle} - Epilogue.md`;
+        } else if (type === 'chapter' && chapterNumber) {
+            if (partNumber && partTitle) {
+                // For multipart books, include part information in filename with "-" separator
+                noteFileName = `${sanitizedBookTitle} - Part ${partNumber} - Chapter ${chapterNumber}.md`;
+            } else {
+                noteFileName = `${sanitizedBookTitle} - Chapter ${chapterNumber}.md`;
+            }
         } else {
             // Fallback
             const sanitizedTitle = sanitizeFileName(title);
@@ -1044,7 +1405,9 @@ function convertCalibreToMarkdown(
     title: string,
     type: 'prologue' | 'chapter' | 'epilogue',
     chapterNumber?: number,
-    bookTitle?: string
+    bookTitle?: string,
+    partNumber?: number,
+    partTitle?: string
 ): string {
     let markdown = '';
 
@@ -1058,11 +1421,23 @@ function convertCalibreToMarkdown(
     if (bookTitle) {
         markdown += `book: "${bookTitle}"\n`;
     }
+    // Add part information for multipart books
+    if (partNumber) {
+        markdown += `part: ${partNumber}\n`;
+    }
+    if (partTitle) {
+        markdown += `partTitle: "${partTitle}"\n`;
+    }
     markdown += `source: epub\n`;
     markdown += `---\n\n`;
 
-    // Add title
-    markdown += `# ${title}\n\n`;
+    // Add title header - include part title for context in multipart books
+    if (type === 'chapter' && partTitle) {
+        markdown += `# ${title}\n\n`;
+        markdown += `*${partTitle}*\n\n`;
+    } else {
+        markdown += `# ${title}\n\n`;
+    }
 
     // Extract main content by removing HTML tags but preserving structure
     let textContent = content;
@@ -1129,14 +1504,8 @@ function convertCalibreToMarkdown(
         .replace(/<a id="page_(\d+)" class="calibre[^"]*"><\/a>/g, '')
         .replace(/<a id="page_(\d+)" class="calibre\d+"><\/a>/g, '');
 
-    // Post-process to convert numbered list footnotes to Obsidian format
-    textContent = textContent
-        // Convert numbered footnote references in text (e.g., "word1" -> "word[^1]")
-        .replace(/(\w+)(\d+)(\s)/g, '$1[^$2]$3')  // Match word+digit+space
-        .replace(/(\w+)(\d+)([.,!?;:])/g, '$1[^$2]$3')  // Match word+digit+punctuation
-        .replace(/(\w+)(\d+)$/gm, '$1[^$2]')  // Match word+digit at end of line
-        // Convert numbered list footnotes at end to Obsidian format
-        .replace(/^(\d+)\.\s+(.+?)$/gm, '[^$1]: $2');
+    // Post-process to clean up text
+    textContent = textContent;
 
     // Handle special content blocks like letters
     textContent = textContent
