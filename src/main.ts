@@ -113,15 +113,15 @@ async function processEpubContent(filePath: string, outputPath: string): Promise
     // TODO: This is temporary
     // /////////////////////////////////////////////////////////////////////////////
 
-    // Create extraction directory
-    const extractDir = path.join(path.dirname(filePath), `${path.basename(filePath, '.epub')}_extracted`);
-    console.log(`💾 Writing extracted files to: ${extractDir}`);
+    // // Create extraction directory
+    // const extractDir = path.join(path.dirname(filePath), `${path.basename(filePath, '.epub')}_extracted`);
+    // console.log(`💾 Writing extracted files to: ${extractDir}`);
 
-    // Write extracted files to disk
-    await writeExtractedFiles(extractedContent.entries, extractDir);
+    // // Write extracted files to disk
+    // await writeExtractedFiles(extractedContent.entries, extractDir);
 
-    console.log(`✅ Extracted ${extractedContent.entries.length} files from EPUB`);
-    console.log(`📁 Files available at: ${extractDir}`);
+    // console.log(`✅ Extracted ${extractedContent.entries.length} files from EPUB`);
+    // console.log(`📁 Files available at: ${extractDir}`);
 
     // /////////////////////////////////////////////////////////////////////////////
 
@@ -1096,6 +1096,13 @@ function convertCalibreToMarkdown(
             return `**${cleanContent}**\n\n`; // Make prologue subtitle bold
         })
         .replace(/<h1[^>]*class="pre_tit"[^>]*>(.*?)<\/h1>/gs, '') // Remove prologue title headers (Pandemia style, redundant with title)
+        // Convert footnote sections to Obsidian format FIRST (before div removal)
+        .replace(/<hr class="border_note"\/>/g, '') // Remove footnote separator (Pandemia style)
+        .replace(/<hr class="bordernote"\/>/g, '') // Remove footnote separator (Dossier 64 style)
+        // Handle Pandemia footnote format
+        .replace(/<div class="ntb" id="ntb-(\d+)"><p class="txt_justif"><a[^>]*>(\d+)<\/a>\.\s*(.*?)<\/p><\/div>/gs, '[^$2]: $3\n\n')
+        // Handle Dossier 64 footnote format
+        .replace(/<div class="ntb" id="NBP(\d+)"><div class="numero"><a[^>]*>(\d+)<\/a>\.\s*<\/div><div class="textenote"><p[^>]*>(.*?)<\/p><\/div><\/div>/gs, '[^$2]: $3\n\n')
         .replace(/<div[^>]*class="dev"[^>]*>/g, '') // Remove dev containers
         .replace(/<\/div>/g, ''); // Remove closing divs
 
@@ -1113,9 +1120,23 @@ function convertCalibreToMarkdown(
         .replace(/<p[^>]*>(.*?)<\/p>/gs, '$1\n\n')
         // Convert italic text
         .replace(/<i class="calibre2">(.*?)<\/i>/gs, '*$1*')
+        // Convert footnote links to Obsidian format
+        // Pandemia format: <a class="apnb" href="#ntb-1">1</a>
+        .replace(/<a class="apnb"[^>]*href="[^#]*#ntb-(\d+)"[^>]*>(\d+)<\/a>/g, '[^$2]')
+        // Dossier 64 format: <a class="apnb" id="ap_NBP1-1" href="part0005.html#NBP1">1</a>
+        .replace(/<a class="apnb"[^>]*href="[^#]*#NBP(\d+)"[^>]*>(\d+)<\/a>/g, '[^$2]')
         // Remove page anchors (no longer needed per requirements)
         .replace(/<a id="page_(\d+)" class="calibre[^"]*"><\/a>/g, '')
         .replace(/<a id="page_(\d+)" class="calibre\d+"><\/a>/g, '');
+
+    // Post-process to convert numbered list footnotes to Obsidian format
+    textContent = textContent
+        // Convert numbered footnote references in text (e.g., "word1" -> "word[^1]")
+        .replace(/(\w+)(\d+)(\s)/g, '$1[^$2]$3')  // Match word+digit+space
+        .replace(/(\w+)(\d+)([.,!?;:])/g, '$1[^$2]$3')  // Match word+digit+punctuation
+        .replace(/(\w+)(\d+)$/gm, '$1[^$2]')  // Match word+digit at end of line
+        // Convert numbered list footnotes at end to Obsidian format
+        .replace(/^(\d+)\.\s+(.+?)$/gm, '[^$1]: $2');
 
     // Handle special content blocks like letters
     textContent = textContent
@@ -1128,7 +1149,9 @@ function convertCalibreToMarkdown(
         .replace(/&[^;]+;/g, '') // Remove HTML entities (basic cleanup)
         .replace(/\n\s*\n\s*\n/g, '\n\n') // Normalize multiple newlines
         .replace(/^[ \t]+/gm, '') // Remove leading whitespace/indentation from lines with content (but preserve blank lines)
-        .replace(/(\d+)([A-ZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ][a-zàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ]+\s+\d{4})([A-ZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ])/g, '$1\n\n$2\n\n$3') // Fix date formatting: "32Novembre 2010La" -> "32\n\nNovembre 2010\n\nLa"
+        // Fix date formatting: "32Novembre 2010La" -> "32\n\nNovembre 2010\n\nLa" 
+        // But be more specific to avoid interfering with footnotes
+        .replace(/(\d{1,2})([A-ZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ][a-zàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ]+\s+\d{4})([A-ZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ])/g, '$1\n\n$2\n\n$3')
         .trim();
 
     markdown += textContent;
