@@ -9,6 +9,97 @@ import * as xml2js from 'xml2js';
 
 const program = new Command();
 
+// Interface for part title information from navigation files
+interface PartTitleInfo {
+    partNumber: number;
+    title: string;
+    href: string;
+}
+
+// Function to parse navigation file and extract part titles
+async function parseNavigationFile(zipFile: yauzl.ZipFile): Promise<Map<number, string>> {
+    const partTitles = new Map<number, string>();
+
+    return new Promise((resolve) => {
+        zipFile.readEntry();
+
+        zipFile.on('entry', (entry) => {
+            // Look for navigation files
+            if (entry.fileName.match(/\.xhtml$/) && (
+                entry.fileName.includes('nav') ||
+                entry.fileName.includes('toc') ||
+                entry.fileName.toLowerCase().includes('navigation')
+            )) {
+                zipFile.openReadStream(entry, (err, readStream) => {
+                    if (err) {
+                        console.log(`Error reading navigation file ${entry.fileName}:`, err);
+                        zipFile.readEntry();
+                        return;
+                    }
+
+                    let content = '';
+                    readStream.on('data', (chunk) => {
+                        content += chunk.toString();
+                    });
+
+                    readStream.on('end', () => {
+                        // Extract part titles from navigation content
+                        // Look for patterns like: <a href="...">Partie 5. Deux femmes d'action déterminées</a>
+                        const partMatches = content.matchAll(/<a[^>]*href="[^"]*"[^>]*>Partie\s+(\d+)\.\s*([^<]+)<\/a>/gi);
+
+                        for (const match of partMatches) {
+                            const partNumber = parseInt(match[1]);
+                            const partTitle = `Partie ${partNumber}. ${match[2].trim()}`;
+                            partTitles.set(partNumber, partTitle);
+                            console.log(`📖 Found part title in navigation: ${partTitle}`);
+                        }
+
+                        zipFile.readEntry();
+                    });
+                });
+            } else {
+                zipFile.readEntry();
+            }
+        });
+
+        zipFile.on('end', () => {
+            resolve(partTitles);
+        });
+    });
+}
+
+// Function to extract part titles from navigation files in entries
+async function extractPartTitlesFromNavigation(entries: Array<{ fileName: string; content: Buffer; isDirectory: boolean; }>): Promise<Map<number, string>> {
+    const partTitles = new Map<number, string>();
+
+    // Look for navigation files in entries
+    for (const entry of entries) {
+        if (entry.isDirectory) continue;
+
+        // Look for navigation files
+        if (entry.fileName.match(/\.xhtml$/) && (
+            entry.fileName.includes('nav') ||
+            entry.fileName.includes('toc') ||
+            entry.fileName.toLowerCase().includes('navigation')
+        )) {
+            const content = entry.content.toString('utf-8');
+
+            // Extract part titles from navigation content
+            // Look for patterns like: <a href="...">Partie 5. Deux femmes d'action déterminées</a>
+            const partMatches = content.matchAll(/<a[^>]*href="[^"]*"[^>]*>Partie\s+(\d+)\.\s*([^<]+)<\/a>/gi);
+
+            for (const match of partMatches) {
+                const partNumber = parseInt(match[1]);
+                const partTitle = `Partie ${partNumber}. ${match[2].trim()}`;
+                partTitles.set(partNumber, partTitle);
+                console.log(`📖 Found part title in navigation: ${partTitle}`);
+            }
+        }
+    }
+
+    return partTitles;
+}
+
 // Define the CLI interface
 program
     .name('obsidiant')
@@ -79,6 +170,10 @@ async function processEpubContent(filePath: string, outputPath: string): Promise
     console.log('📦 Extracting EPUB archive...');
     const extractedContent = await extractEpubArchive(filePath);
 
+    // Parse navigation files for part titles
+    console.log('📖 Parsing navigation files for part titles...');
+    const navigationPartTitles = await extractPartTitlesFromNavigation(extractedContent.entries);
+
     // Parse EPUB metadata and structure
     console.log('📋 Parsing EPUB metadata...');
     const epubMetadata = await parseEpubMetadata(extractedContent.entries);
@@ -88,7 +183,7 @@ async function processEpubContent(filePath: string, outputPath: string): Promise
 
     // Classify content structure
     console.log('📚 Analyzing content structure...');
-    const contentClassification = await classifyEpubContent(epubMetadata.spine, extractedContent.entries);
+    const contentClassification = await classifyEpubContent(epubMetadata.spine, extractedContent.entries, navigationPartTitles);
 
 
     // Log detailed classification results
@@ -407,7 +502,8 @@ function extractInternalChapters(content: string, item: any, partNumber: number,
  */
 async function classifyEpubContent(
     spine: Array<{ id: string; href: string; }>,
-    entries: Array<{ fileName: string; content: Buffer; isDirectory: boolean; }>
+    entries: Array<{ fileName: string; content: Buffer; isDirectory: boolean; }>,
+    navigationPartTitles: Map<number, string>
 ): Promise<ContentClassification> {
     const classification: ContentClassification = {
         frontMatter: [],
@@ -445,39 +541,78 @@ async function classifyEpubContent(
         if (fileName) {
             const filePartMatch = fileName.match(/c(\d+)_part_cut(\d+)\.xhtml/);
             if (filePartMatch) {
-                partNumber = parseInt(filePartMatch[1]);
-                partTitle = `Part ${partNumber}`;
-                console.log(`📁 Found part from filename: ${fileName} -> Part ${partNumber}`);
+                const filePartNumber = parseInt(filePartMatch[1]);
+
+                // Map file part numbers to navigation part numbers
+                // Files c05-c12 map to navigation parts 1-8
+                const navigationPartNumber = filePartNumber - 4; // c05 -> 1, c06 -> 2, etc.
+
+                // Check if we have a navigation title for this mapped part
+                const navTitle = navigationPartTitles.get(navigationPartNumber);
+                if (navTitle) {
+                    partNumber = navigationPartNumber; // Use the mapped number
+                    partTitle = navTitle;
+                    console.log(`📖 Using navigation part title (c${filePartNumber} -> part ${navigationPartNumber}): ${partTitle}`);
+                } else {
+                    // Fallback to original logic if no navigation title found
+                    partNumber = filePartNumber;
+                    partTitle = `Part ${partNumber}`;
+                    console.log(`📁 Found part from filename: ${fileName} -> Part ${partNumber}`);
+                }
             }
         }
 
-        // Look for part headers with patterns like "PARTIE 1" and part titles
-        const partNumberMatch = content.match(/<h1[^>]*class="part_number"[^>]*>.*?(\d+).*?<\/h1>/is);
-        const partTitleMatch = content.match(/<h2[^>]*class="part_title"[^>]*>(.*?)<\/h2>/is);
+        // Look for part headers with patterns like "PARTIE 1" and part titles (only if we don't have navigation title)
+        if (!partTitle) {
+            const partNumberMatch = content.match(/<h1[^>]*class="part_number"[^>]*>.*?(\d+).*?<\/h1>/is);
+            const partTitleMatch = content.match(/<h2[^>]*class="part_title"[^>]*>(.*?)<\/h2>/is);
 
-        // Look for part headers in content (language-agnostic)
-        const partHeaderMatch = content.match(/<h[1-3][^>]*>(.*?)<\/h[1-3]>/is);
+            // Look for part headers in content (language-agnostic)
+            const partHeaderMatch = content.match(/<h[1-3][^>]*>(.*?)<\/h[1-3]>/is);
 
-        if (partHeaderMatch) {
-            const headerText = partHeaderMatch[1].replace(/<[^>]*>/g, '').trim();
-            console.log(`🔍 Found header text: "${headerText}"`);
+            if (partHeaderMatch) {
+                const headerText = partHeaderMatch[1].replace(/<[^>]*>/g, '').trim();
+                console.log(`🔍 Found header text: "${headerText}"`);
 
-            // Try to extract any number from the header text (language-agnostic)
-            const numberMatch = headerText.match(/(\d+)/);
-            if (numberMatch) {
-                // Don't use this number directly - it will be remapped later
-                // Just mark that this is a part header
-                partTitle = headerText;
-                console.log(`� Found part header: "${headerText}"`);
+                // Try to extract any number from the header text (language-agnostic)
+                const numberMatch = headerText.match(/(\d+)/);
+                if (numberMatch) {
+                    const headerPartNumber = parseInt(numberMatch[1]);
+
+                    // Check if we have a navigation title for this part
+                    const navTitle = navigationPartTitles.get(headerPartNumber);
+                    if (navTitle) {
+                        partNumber = headerPartNumber;
+                        partTitle = navTitle;
+                        console.log(`📖 Using navigation part title from header: ${partTitle}`);
+                    } else {
+                        // Don't use this number directly - it will be remapped later
+                        // Just mark that this is a part header
+                        partTitle = headerText;
+                        console.log(`🔍 Found part header: "${headerText}"`);
+                    }
+                }
             }
-        }
 
-        if (partNumberMatch) {
-            partNumber = parseInt(partNumberMatch[1]);
-        }
+            if (partNumberMatch) {
+                const contentPartNumber = parseInt(partNumberMatch[1]);
 
-        if (partTitleMatch) {
-            partTitle = partTitleMatch[1].replace(/<[^>]*>/g, '').trim();
+                // Check if we have a navigation title for this part
+                const navTitle = navigationPartTitles.get(contentPartNumber);
+                if (navTitle) {
+                    partNumber = contentPartNumber;
+                    partTitle = navTitle;
+                    console.log(`📖 Using navigation part title from content: ${partTitle}`);
+                } else {
+                    partNumber = contentPartNumber;
+                }
+            }
+
+            if (partTitleMatch) {
+                if (!partTitle || !navigationPartTitles.has(partNumber || 0)) {
+                    partTitle = partTitleMatch[1].replace(/<[^>]*>/g, '').trim();
+                }
+            }
         }
 
         // Extract title from various sources, but be smart about it
@@ -1156,20 +1291,19 @@ source: epub
 chapters: ${contentClassification?.chapters.length || metadata.spine.length}
 imported: ${new Date().toISOString().split('T')[0]}${coverFileName ? `\ncover: "[[${coverFileName}]]"` : ''}
 ---
-
 # ${metadata.title || 'Unknown Title'}
 `;
 
     // Add content structure if available
     if (contentClassification) {
         // Add chapters list with prologue and epilogue included
-        obsidianNote += `\n## Table of Contents\n\n`;
+        obsidianNote += `\n## Table of Contents\n`;
 
         // Add prologue if exists
         if (contentClassification.prologue) {
             const prologueTitle = contentClassification.prologue.title || 'Prologue';
             const prologueFileName = `${sanitizedTitle} - ${sanitizeFileName(prologueTitle)}`;
-            obsidianNote += `**Prologue**: [[${prologueFileName}]]\n`;
+            obsidianNote += `\n**Prologue**: [[${prologueFileName}]]\n`;
         }
 
         // Check if this is a multipart book
@@ -1188,8 +1322,20 @@ imported: ${new Date().toISOString().split('T')[0]}${coverFileName ? `\ncover: "
 
             // Generate ToC by parts
             for (const [partNumber, chapters] of partGroups) {
-                const partTitle = chapters[0]?.partTitle || `Part ${partNumber}`;
-                obsidianNote += `\n### ${partTitle}\n\n`;
+                const rawPartTitle = chapters[0]?.partTitle;
+                let partTitle: string;
+
+                // Check if we have a meaningful part title (not just a number or generic text)
+                if (rawPartTitle &&
+                    rawPartTitle !== `Part ${partNumber}` &&
+                    !/^\d+\.?$/.test(rawPartTitle.trim()) && // Not just a number like "1." or "5"
+                    rawPartTitle.trim().length > 2) { // Has substantial content
+                    partTitle = `Part ${partNumber} - ${rawPartTitle}`;
+                } else {
+                    partTitle = `Part ${partNumber}`;
+                }
+
+                obsidianNote += `\n### ${partTitle}\n`;
 
                 chapters.forEach(chapter => {
                     const chapterNumber = chapter.chapterNumber;
@@ -1199,6 +1345,7 @@ imported: ${new Date().toISOString().split('T')[0]}${coverFileName ? `\ncover: "
             }
         } else {
             // Single-part book - use simple numbering
+            obsidianNote += `\n`;
             contentClassification.chapters.forEach((chapter, index) => {
                 const chapterNumber = chapter.chapterNumber || index + 1;
                 const chapterFileName = `${sanitizedTitle} - Chapter ${chapterNumber}`;
@@ -1210,7 +1357,7 @@ imported: ${new Date().toISOString().split('T')[0]}${coverFileName ? `\ncover: "
         if (contentClassification.epilogue) {
             const epilogueTitle = contentClassification.epilogue.title || 'Epilogue';
             const epilogueFileName = `${sanitizedTitle} - ${sanitizeFileName(epilogueTitle)}`;
-            obsidianNote += `**Epilogue**: [[${epilogueFileName}]]\n`;
+            obsidianNote += `\n**Epilogue**: [[${epilogueFileName}]]\n`;
         }
     }
 
